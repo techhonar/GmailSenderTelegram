@@ -72,19 +72,23 @@ function checkAndForwardEmails() {
         continue;
       }
 
-      const subject = msg.getSubject() || "(no subject)";
-      const date    = msg.getDate().toLocaleString();
-      const body    = msg.getPlainBody() || "";
+      const subject     = msg.getSubject() || "(no subject)";
+      const date        = msg.getDate().toLocaleString();
+      const body        = msg.getPlainBody() || "";
+      const attachments = msg.getAttachments();
 
       // Truncate body preview
       const preview = body.length > 800 ? body.substring(0, 800) + "…" : body;
+      const attachmentNote = attachments.length > 0
+        ? `\n📎 ${attachments.length} attachment(s)`
+        : "";
 
       const text =
-        `📧 New Email\n\n` +
-        `From: ${from}\n` +
-        `Subject: ${subject}\n` +
-        `Date: ${date}\n\n` +
-        `${preview}`;
+        `📧 <b>New Email</b>\n\n` +
+        `<b>From:</b> ${escapeHtml(from)}\n` +
+        `<b>Subject:</b> ${escapeHtml(subject)}\n` +
+        `<b>Date:</b> ${escapeHtml(date)}${attachmentNote}\n\n` +
+        `${escapeHtml(preview)}`;
 
       // Send to all allowed users
       for (const chatId of ALLOWED_CHAT_IDS) {
@@ -92,7 +96,7 @@ function checkAndForwardEmails() {
         Utilities.sleep(1000);
       }
 
-      // ✅ Save preview in lastEmails too
+      // Save to last emails log (keep last 5)
       lastEmails.unshift({ from, subject, date, preview });
       if (lastEmails.length > 5) lastEmails.pop();
 
@@ -121,7 +125,7 @@ function runEvery30Seconds() {
 
 
 // ─────────────────────────────────────────────
-//  TELEGRAM COMMANDS HANDLER
+//  TELEGRAM COMMANDS + BUTTON HANDLER
 // ─────────────────────────────────────────────
 function handleCommands() {
   const props = PropertiesService.getScriptProperties();
@@ -135,8 +139,15 @@ function handleCommands() {
 
   for (const update of data.result) {
     const updateId = update.update_id;
-    const msg      = update.message;
 
+    // Handle inline button taps (callback queries)
+    if (update.callback_query) {
+      handleCallbackQuery(update.callback_query);
+      props.setProperty("lastUpdateId", String(updateId));
+      continue;
+    }
+
+    const msg = update.message;
     if (!msg || !msg.text) {
       props.setProperty("lastUpdateId", String(updateId));
       continue;
@@ -145,24 +156,46 @@ function handleCommands() {
     const chatId = String(msg.chat.id);
     const text   = msg.text.trim();
 
-    // Only respond to allowed users
     if (!ALLOWED_CHAT_IDS.includes(chatId)) {
       sendTelegram("⛔ You are not authorized to use this bot.", chatId);
       props.setProperty("lastUpdateId", String(updateId));
       continue;
     }
 
-    if (text === "/start") {
-      handleStart(chatId);
-    } else if (text === "/status") {
-      handleStatus(chatId);
-    } else if (text === "/last") {
-      handleLast(chatId);
-    } else {
-      sendTelegram("❓ Unknown command. Send /start to see the menu.", chatId);
-    }
-
+    routeCommand(text, chatId);
     props.setProperty("lastUpdateId", String(updateId));
+  }
+}
+
+
+function handleCallbackQuery(callback) {
+  const chatId = String(callback.message.chat.id);
+
+  // Acknowledge the tap so Telegram clears the button's loading spinner
+  answerCallbackQuery(callback.id);
+
+  if (!ALLOWED_CHAT_IDS.includes(chatId)) {
+    sendTelegram("⛔ You are not authorized to use this bot.", chatId);
+    return;
+  }
+
+  routeCommand(callback.data, chatId);
+}
+
+
+function routeCommand(text, chatId) {
+  if (text === "/start" || text === "/help") {
+    handleStart(chatId);
+  } else if (text === "/status") {
+    handleStatus(chatId);
+  } else if (text === "/last") {
+    handleLast(chatId);
+  } else if (text === "/pause") {
+    handlePause(chatId);
+  } else if (text === "/resume") {
+    handleResume(chatId);
+  } else {
+    sendTelegram("❓ Unknown command. Send /start to see the menu.", chatId);
   }
 }
 
@@ -172,14 +205,17 @@ function handleCommands() {
 // ─────────────────────────────────────────────
 function handleStart(chatId) {
   const menu =
-    `👋 Welcome to your Gmail Bot!\n\n` +
-    `Here are the available commands:\n\n` +
+    `👋 <b>Welcome to your Gmail Bot!</b>\n\n` +
+    `Available commands:\n\n` +
     `📊 /status — Check if the bot is running\n` +
-    `📬 /last — Show the last 5 emails received`;
+    `📬 /last — Show the last 5 emails received\n` +
+    `⏸ /pause — Stop forwarding new emails\n` +
+    `▶️ /resume — Resume forwarding\n` +
+    `❓ /help — Show this menu`;
 
   sendTelegramWithButtons(menu, chatId, [
-    [{ text: "📊 Status", callback_data: "/status" }],
-    [{ text: "📬 Last 5 Emails", callback_data: "/last" }],
+    [{ text: "📊 Status", callback_data: "/status" }, { text: "📬 Last 5", callback_data: "/last" }],
+    [{ text: "⏸ Pause", callback_data: "/pause" }, { text: "▶️ Resume", callback_data: "/resume" }],
   ]);
 }
 
@@ -192,9 +228,9 @@ function handleStatus(chatId) {
   const totalSent = sentRaw ? JSON.parse(sentRaw).length : 0;
 
   const status =
-    `📊 Bot Status\n\n` +
+    `📊 <b>Bot Status</b>\n\n` +
     `• Status: ${paused ? "⏸ Paused" : "✅ Running"}\n` +
-    `• Last check: ${lastCheck}\n` +
+    `• Last check: ${escapeHtml(lastCheck)}\n` +
     `• Emails forwarded: ${totalSent}`;
 
   sendTelegramWithButtons(status, chatId, [
@@ -213,36 +249,59 @@ function handleLast(chatId) {
     return;
   }
 
-  // Send each email as a separate message so it's not too long
-  sendTelegram(`📬 Last ${lastEmails.length} Email(s):`, chatId);
+  sendTelegram(`📬 <b>Last ${lastEmails.length} Email(s):</b>`, chatId);
   Utilities.sleep(500);
 
   lastEmails.forEach((e, i) => {
     const emailText =
-      `📧 #${i + 1}\n` +
-      `From: ${e.from}\n` +
-      `Subject: ${e.subject}\n` +
-      `Date: ${e.date}\n\n` +
-      `${e.preview || "(no body)"}`;
+      `📧 <b>#${i + 1}</b>\n` +
+      `<b>From:</b> ${escapeHtml(e.from)}\n` +
+      `<b>Subject:</b> ${escapeHtml(e.subject)}\n` +
+      `<b>Date:</b> ${escapeHtml(e.date)}\n\n` +
+      `${escapeHtml(e.preview || "(no body)")}`;
 
     sendTelegram(emailText, chatId);
     Utilities.sleep(700);
   });
 
-  sendTelegramWithButtons("─────────────────", chatId, [
+  sendTelegramWithButtons("────────────", chatId, [
     [{ text: "🔄 Refresh", callback_data: "/last" }],
   ]);
+}
+
+
+function handlePause(chatId) {
+  PropertiesService.getScriptProperties().setProperty("paused", "true");
+  sendTelegram("⏸ Forwarding paused. Send /resume anytime to continue.", chatId);
+}
+
+
+function handleResume(chatId) {
+  PropertiesService.getScriptProperties().setProperty("paused", "false");
+  sendTelegram("✅ Forwarding resumed.", chatId);
 }
 
 
 // ─────────────────────────────────────────────
 //  TELEGRAM HELPERS
 // ─────────────────────────────────────────────
-function sendTelegram(text, chatId) {
+function escapeHtml(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+
+function sendTelegram(text, chatId, retries) {
+  if (retries === undefined) retries = 1;
+
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const payload = {
     chat_id: chatId,
     text: text,
+    parse_mode: "HTML",
   };
 
   const options = {
@@ -257,9 +316,17 @@ function sendTelegram(text, chatId) {
     const result   = JSON.parse(response.getContentText());
     if (!result.ok) {
       console.error(`Telegram error for ${chatId}: ` + response.getContentText());
+      if (retries > 0) {
+        Utilities.sleep(1000);
+        sendTelegram(text, chatId, retries - 1);
+      }
     }
   } catch (e) {
     console.error(`Failed to send to ${chatId}: ${e.message}`);
+    if (retries > 0) {
+      Utilities.sleep(1000);
+      sendTelegram(text, chatId, retries - 1);
+    }
   }
 }
 
@@ -269,6 +336,7 @@ function sendTelegramWithButtons(text, chatId, buttons) {
   const payload = {
     chat_id: chatId,
     text: text,
+    parse_mode: "HTML",
     reply_markup: { inline_keyboard: buttons },
   };
 
@@ -291,12 +359,31 @@ function sendTelegramWithButtons(text, chatId, buttons) {
 }
 
 
+function answerCallbackQuery(callbackQueryId) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/answerCallbackQuery`;
+  const payload = { callback_query_id: callbackQueryId };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  };
+
+  try {
+    UrlFetchApp.fetch(url, options);
+  } catch (e) {
+    console.error("answerCallbackQuery failed: " + e.message);
+  }
+}
+
+
 // ─────────────────────────────────────────────
 //  TEST & RESET UTILITIES
 // ─────────────────────────────────────────────
 function testBot() {
   for (const chatId of ALLOWED_CHAT_IDS) {
-    sendTelegram("✅ Gmail → Telegram bot is working!", chatId);
+    sendTelegram("✅ <b>Gmail → Telegram bot is working!</b>", chatId);
     Utilities.sleep(1000);
   }
 }
